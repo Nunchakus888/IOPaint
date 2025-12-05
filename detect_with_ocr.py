@@ -200,13 +200,13 @@ class OCRWatermarkDetector:
         print(f"  Edge detection: {len(boxes)} regions")
         return boxes
     
-    def generate_mask(self, expansion: int = 3, mode: str = 'precise') -> np.ndarray:
+    def generate_mask(self, expansion: int = 3, mode: str = 'smart') -> np.ndarray:
         """
         Generate mask from detected text regions
         
         Args:
             expansion: Expand mask by N pixels
-            mode: 'rect'=rectangle, 'precise'=contour, 'strict'=minimal
+            mode: 'smart'=auto (default), 'rect'=rectangle, 'precise'=contour
         
         Returns:
             Binary mask
@@ -219,18 +219,31 @@ class OCRWatermarkDetector:
         if not boxes:
             return mask
         
-        print(f"🎨 Generating {mode} mask...")
+        print(f"🎨 Generating {mode} mask ({len(boxes)} regions)...")
         
-        if mode == 'rect':
-            # Simple rectangle fill
-            for box in boxes:
+        rect_count = 0
+        contour_count = 0
+        
+        for box in boxes:
+            if mode == 'rect':
                 cv2.fillPoly(mask, [box], 255)
-        else:
-            # Extract precise text contours
-            strict = (mode == 'strict')
-            for box in boxes:
-                contour_mask = self._extract_text_contour(box, strict=strict)
+                rect_count += 1
+            elif mode == 'precise':
+                contour_mask = self._extract_text_contour(box)
                 mask = cv2.bitwise_or(mask, contour_mask)
+                contour_count += 1
+            else:  # smart mode
+                # Check if this region is in complex background
+                if self._is_complex_background(box):
+                    contour_mask = self._extract_text_contour(box)
+                    mask = cv2.bitwise_or(mask, contour_mask)
+                    contour_count += 1
+                else:
+                    cv2.fillPoly(mask, [box], 255)
+                    rect_count += 1
+        
+        if mode == 'smart':
+            print(f"  📦 Rect: {rect_count}, 🎯 Contour: {contour_count}")
         
         # Minimal expansion to ensure coverage
         if expansion > 0:
@@ -244,11 +257,11 @@ class OCRWatermarkDetector:
     
     def _extract_text_contour(self, box: np.ndarray, strict: bool = False) -> np.ndarray:
         """
-        Extract precise watermark text contour (gray text only)
+        Extract precise watermark text contour using local analysis
         
         Args:
             box: Detected text bounding box
-            strict: If True, use stricter thresholds (less coverage but fewer false positives)
+            strict: If True, use stricter thresholds
         
         Returns:
             Mask with only watermark text pixels marked
@@ -267,52 +280,87 @@ class OCRWatermarkDetector:
         if x_max <= x_min or y_max <= y_min:
             return mask
         
-        # Extract ROI
         roi = self.image[y_min:y_max, x_min:x_max]
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        h, w = roi_gray.shape
+        
+        # Method 1: Local contrast analysis
+        # Watermark text has different intensity from local background
+        local_mean = cv2.blur(roi_gray, (15, 15))
+        diff = cv2.absdiff(roi_gray, local_mean)
+        
+        # Threshold the difference - watermark text stands out
+        thresh = 10 if strict else 8
+        _, text_mask = cv2.threshold(diff, thresh, 255, cv2.THRESH_BINARY)
+        
+        # Method 2: Gray color filter (watermarks are typically gray)
         roi_lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-        
-        # Thresholds based on mode
-        if strict:
-            color_thresh = 15   # Stricter gray detection
-            l_low, l_high = 100, 200
-        else:
-            color_thresh = 25   # More lenient
-            l_low, l_high = 80, 220
-        
-        # Key insight: watermarks are GRAY (low color saturation)
         l, a, b = cv2.split(roi_lab)
         
-        # Gray pixels: a and b near 128 (neutral)
+        color_thresh = 20 if strict else 30
         gray_mask = (
             (np.abs(a.astype(np.int16) - 128) < color_thresh) & 
             (np.abs(b.astype(np.int16) - 128) < color_thresh)
         ).astype(np.uint8) * 255
         
-        # Brightness filter
-        brightness_mask = (
-            (l > l_low) & (l < l_high)
-        ).astype(np.uint8) * 255
+        # Combine: text that is also gray
+        roi_mask = cv2.bitwise_and(text_mask, gray_mask)
         
-        # Combine: must be gray AND mid-brightness
-        roi_mask = cv2.bitwise_and(gray_mask, brightness_mask)
+        # Clean up with morphology
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # Detect text-like edges within gray regions
-        edges = cv2.Canny(roi_gray, 30, 100)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Combine with gray mask
-        roi_mask = cv2.bitwise_and(roi_mask, edges)
-        
-        # Connect nearby pixels (text strokes)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # Remove very small components (noise)
+        contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        roi_mask_clean = np.zeros_like(roi_mask)
+        min_area = 5 if not strict else 10
+        for cnt in contours:
+            if cv2.contourArea(cnt) >= min_area:
+                cv2.drawContours(roi_mask_clean, [cnt], -1, 255, -1)
         
         # Place ROI mask back into full mask
-        mask[y_min:y_max, x_min:x_max] = roi_mask
+        mask[y_min:y_max, x_min:x_max] = roi_mask_clean
         
         return mask
+    
+    def _is_complex_background(self, box: np.ndarray) -> bool:
+        """
+        Check if region has complex background (needs precise contour)
+        Complex = high variance, multi-color, or near edges
+        """
+        box_2d = box.reshape(-1, 2)
+        x_min, y_min = max(0, int(box_2d[:, 0].min())), max(0, int(box_2d[:, 1].min()))
+        x_max, y_max = min(self.width, int(box_2d[:, 0].max())), min(self.height, int(box_2d[:, 1].max()))
+        
+        if x_max <= x_min or y_max <= y_min:
+            return False
+        
+        roi = self.image[y_min:y_max, x_min:x_max]
+        if roi.size == 0:
+            return False
+        
+        # 1. High color variance = complex background
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat_std = np.std(hsv[:, :, 1])
+        val_std = np.std(hsv[:, :, 2])
+        
+        if sat_std > 30 or val_std > 40:
+            return True
+        
+        # 2. Has multiple distinct colors
+        mean_sat = np.mean(hsv[:, :, 1])
+        if mean_sat > 25:  # Not pure gray
+            return True
+        
+        # 3. High edge density = detailed content
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_ratio = np.count_nonzero(edges) / edges.size
+        if edge_ratio > 0.1:
+            return True
+        
+        return False
     
     def save_mask(self, mask: np.ndarray, output_path: Path):
         """Save mask"""
@@ -387,8 +435,8 @@ Notes:
                        help='Output mask path (default: input_mask.png)')
     parser.add_argument('--expand', type=int, default=3,
                        help='Expand mask by N pixels (default: 3)')
-    parser.add_argument('--mode', choices=['rect', 'precise', 'strict'], default='precise',
-                       help='Mask mode: rect=rectangle, precise=contour, strict=minimal (default: precise)')
+    parser.add_argument('--mode', choices=['smart', 'rect', 'precise'], default='smart',
+                       help='Mask mode: smart=auto (default), rect=rectangle, precise=contour')
     parser.add_argument('--no-preview', action='store_true',
                        help='Do not generate preview')
     

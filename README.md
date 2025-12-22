@@ -70,6 +70,9 @@ You can install and start IOPaint easily by running following command:
 # pip3 install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/rocm5.6
 
 pip3 install iopaint
+
+export KMP_DUPLICATE_LIB_OK=TRUE && iopaint start --model=lama --device=cpu --port=8080
+
 iopaint start --model=lama --device=cpu --port=8080
 ```
 

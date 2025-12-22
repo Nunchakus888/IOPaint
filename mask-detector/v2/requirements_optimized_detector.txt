@@ -1,0 +1,10 @@
+# 优化版水印检测器的依赖包
+# 使用 uv pip install -r requirements_optimized_detector.txt 安装
+
+# OCR支持（可选，用于文字验证）
+easyocr>=1.7.0
+
+# 基础依赖（已在主requirements.txt中）
+opencv-python
+numpy
+Pillow

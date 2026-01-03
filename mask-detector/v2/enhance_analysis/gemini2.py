@@ -173,6 +173,6 @@ def extract_watermarks_by_group(input_folder, output_folder):
 
 # --- 配置 ---
 INPUT_DIR = 'enhance_analysis/images'
-OUTPUT_DIR = 'enhance_analysis/runs/extract_watermark'
+OUTPUT_DIR = 'enhance_analysis/masks'
 
 extract_watermarks_by_group(INPUT_DIR, OUTPUT_DIR)

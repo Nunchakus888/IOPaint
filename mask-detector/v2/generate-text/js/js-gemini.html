@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>背景水印生成器</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000; /* 黑底 */
+        }
+        #watermark-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* 确保不影响点击页面元素 */
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body>
+
+<div id="watermark-container"></div>
+
+<script>
+    const config = {
+        angle: -20,          // 倾斜角度
+        fontSize: 24,        // 基础字号
+        fontFamily: "Arial, 'Microsoft YaHei', sans-serif",
+        textColor: "rgba(255, 255, 255, 0.4)", // 白色，带一点透明度更自然
+        rowGap: 120,         // 行间距
+        itemGap: 60,         // 文字块间距
+        content: [
+            { text: "雪票、酒店、教练、摄影师、约玩", style: "normal" },
+            { 
+                segments: [
+                    { text: "滑呗 app ", style: "bold" }, 
+                    { text: "1000万雪友的选择", style: "lighter" }
+                ]
+            }
+        ]
+    };
+
+    function createWatermark() {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // 设置单个单元格的大小，需足够容纳两行文字
+        canvas.width = 600;
+        canvas.height = config.rowGap * 2;
+
+        // 移动原点到中心并旋转
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate((config.angle * Math.PI) / 180);
+        ctx.fillStyle = config.textColor;
+
+        // 绘制第一行
+        ctx.font = `${config.fontSize}px ${config.fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.fillText(config.content[0].text, 0, -config.rowGap / 4);
+
+        // 绘制第二行 (处理不同 Style 的拼接)
+        const line2 = config.content[1].segments;
+        ctx.font = `bold ${config.fontSize + 4}px ${config.fontFamily}`; // 滑呗加粗加大
+        const width1 = ctx.measureText(line2[0].text).width;
+        
+        ctx.font = `${config.fontSize - 2}px ${config.fontFamily}`; // 后半段缩小
+        const width2 = ctx.measureText(line2[1].text).width;
+        
+        const totalW = width1 + width2;
+        const startX = -totalW / 2;
+
+        // 绘制第二行前半部分
+        ctx.textAlign = 'left';
+        ctx.font = `bold ${config.fontSize + 4}px ${config.fontFamily}`;
+        ctx.fillText(line2[0].text, startX, config.rowGap / 4);
+        
+        // 绘制第二行后半部分
+        ctx.font = `${config.fontSize - 2}px ${config.fontFamily}`;
+        ctx.fillText(line2[1].text, startX + width1, config.rowGap / 4);
+
+        // 将 Canvas 转为图片并设为背景
+        const base64 = canvas.toDataURL('image/png');
+        document.getElementById('watermark-container').style.backgroundImage = `url(${base64})`;
+    }
+
+    createWatermark();
+</script>
+</body>
+</html>

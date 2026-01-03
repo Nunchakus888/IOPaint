@@ -7,11 +7,67 @@ import re
 def scan_images_recursive(input_folder, pattern=r'.*x700\.(jpg|jpeg|png|bmp)$'):
     image_paths = []
     for root, dirs, files in os.walk(input_folder):
-        dirs[:] = [d for d in dirs if d != 'post'] # 跳过特定目录
+        dirs[:] = [d for d in dirs if d != 'post']
         for file in files:
             if re.match(pattern, file, re.IGNORECASE):
                 image_paths.append(os.path.join(root, file))
     return image_paths
+
+def filter_by_line_geometry(mask, angle_deg=25, line_width=25, min_density_ratio=0.2):
+    """
+    基于几何特征过滤噪音：水印是倾斜25度的平行多行文本
+    行间的孤立像素必为噪音
+    """
+    h, w = mask.shape
+    angle_rad = np.radians(angle_deg)
+    sin_a, cos_a = np.sin(angle_rad), np.cos(angle_rad)
+    
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return mask
+    
+    # 投影到垂直于行方向
+    projections = (xs * sin_a + ys * cos_a).astype(int)
+    proj_min, proj_max = projections.min(), projections.max()
+    n = proj_max - proj_min + 1
+    
+    # 构建密度直方图
+    hist = np.zeros(n, dtype=int)
+    for p in projections:
+        hist[p - proj_min] += 1
+    
+    # 滑动窗口统计密度
+    kernel = np.ones(line_width)
+    density = np.convolve(hist, kernel, mode='same')
+    
+    # 主阈值：用于中间区域
+    threshold = density.max() * min_density_ratio
+    
+    # 标记有效区域
+    valid_proj = density >= threshold
+    
+    # 边缘修复：首尾区域使用更宽松的阈值
+    # 尾部范围要更大，因为右下角截断更严重
+    head_range = line_width
+    tail_range = line_width * 2  # 尾部用更大范围
+    
+    # 首部修复
+    for i in range(min(head_range, n)):
+        if density[i] >= threshold * 0.3:
+            valid_proj[i] = True
+    
+    # 尾部修复（范围更大，阈值更低）
+    for i in range(max(0, n - tail_range), n):
+        if density[i] >= threshold * 0.1:  # 更宽松
+            valid_proj[i] = True
+    
+    # 过滤
+    clean_mask = np.zeros_like(mask)
+    for x, y, p in zip(xs, ys, projections):
+        if valid_proj[p - proj_min]:
+            clean_mask[y, x] = 255
+    
+    return clean_mask
 
 def extract_watermarks_by_group(input_folder, output_folder):
     if not os.path.exists(output_folder):
@@ -34,6 +90,8 @@ def extract_watermarks_by_group(input_folder, output_folder):
         group_name = f"{w}x{h}"
         
         print(f"--- 正在计算分组: {group_name} (样本数: {count}) ---")
+        # print file_paths under group 
+        # print(f"🔍 文件路径: {'\n'.join(file_paths)}")
         
         if count < 2:
             print(f"⚠️ 样本太少，跳过")
@@ -90,22 +148,21 @@ def extract_watermarks_by_group(input_folder, output_folder):
         result = result.astype(np.uint8)
 
         # 2. 阈值提取
-        # 因为我们累加了连续信号，这里的信噪比非常高
-        # 使用 OTSU 自动阈值通常效果最好，如果觉得噪点多，可以换成 cv2.threshold(result, 60, 255, ...)
         _, mask = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         
-        # 3. 关键修复：让文字更饱满，不缺失
-        # 之前的代码可能腐蚀过度，这里我们做一点点“膨胀”来连接断点
+        # 3. 基于几何特征去噪：利用25度倾斜的平行行特征
+        mask = filter_by_line_geometry(mask, angle_deg=25, line_width=25, min_density_ratio=0.2)
         
-        # 步骤 3.1: 移除微小噪点 (背景里的星星点点)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
-        
-        # 步骤 3.2: 膨胀 (Dilation) - 让细笔画变粗，连接断裂处
-        # 3x3 的核比较温和
-        mask = cv2.dilate(mask, np.ones((3,3), np.uint8), iterations=1)
-        
-        # 步骤 3.3: 闭运算 (Closing) - 填补文字内部的空洞
+        # 4. 闭运算连接断开的笔画
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+        
+        # 5. 移除小连通区域（清理残留细线噪点）
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        clean_mask = np.zeros_like(mask)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= 50:
+                clean_mask[labels == i] = 255
+        mask = clean_mask
 
         # 保存结果
         output_filename = f"mask_{w}x{h}.png"

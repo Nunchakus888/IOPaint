@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>全屏文字水印效果 1:1还原</title>
+    <style>
+        /* 基础重置 */
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden; /* 禁止滚动 */
+            background-color: #000; /* 要求：黑底 */
+            font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* 核心容器：用于放置水印文字内容 */
+        #watermark-container {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            /* 尺寸由 JS 根据原图动态计算 */
+            transform: translate(-50%, -50%);
+            
+            /* Flex 布局处理行 */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            
+            /* 避免鼠标交互影响 */
+            pointer-events: none;
+            user-select: none;
+            z-index: 9999;
+        }
+
+        /* 每一行的样式 */
+        .wm-row {
+            display: flex;
+            width: 100%;
+            justify-content: center; /* 确保相同内容的行在竖直方向视觉对齐 */
+            white-space: nowrap;
+            box-sizing: border-box;
+        }
+
+        /* 文字基础样式 */
+        .wm-text-item {
+            color: #e68edd;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        /* 背景原图层 - 用于对比 */
+        #background-image {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            /* 1:1 原始比例，不缩放 */
+            width: auto;
+            height: auto;
+            z-index: 1;
+            cursor: move;
+        }
+
+        /* 调试面板 */
+        #debug-panel {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: #0f0;
+            padding: 10px 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 12px;
+            z-index: 10000;
+            user-select: none;
+            line-height: 1.6;
+        }
+        #debug-panel kbd {
+            background: #333;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin: 0 2px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 调试面板 -->
+    <div id="debug-panel">
+        <div>📍 偏移: <span id="offset-display">X: 0, Y: 0</span></div>
+        <div>🔍 透明度: <span id="opacity-display">100%</span></div>
+        <hr style="border-color: #333; margin: 6px 0;">
+        <div><kbd>拖拽</kbd> 移动原图</div>
+        <div><kbd>↑</kbd><kbd>↓</kbd> 调整透明度</div>
+        <div><kbd>R</kbd> 重置位置</div>
+        <div><kbd>H</kbd> 隐藏/显示原图</div>
+    </div>
+
+    <!-- 原图背景层 -->
+    <img id="background-image" src="./input.jpg" alt="原图对比">
+    
+    <!-- 水印层 -->
+    <div id="watermark-container"></div>
+
+    <script>
+        /**
+         * 配置区域 - 支持 1:1 还原的数值调整
+         */
+        const config = {
+            // 整体角度，逆时针旋转使用负数 (-25度)
+            rotateAngle: -25, 
+            
+            // 基础字体大小 (px)
+            fontSize: 22,
+
+            // 字体栈：优先苹方和微软雅黑，1:1还原黑体质感
+            fontFamily: '-apple-system, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif',
+
+            // CSS颜色 (支持 rgba 透明度)
+            // color: 'rgba(255, 255, 255, 1)',
+            color: 'pink',
+
+            // 行与行之间的垂直间距 (px)，约为字号的 3.5 倍
+            rowGap: 30, 
+
+            // 同一行内，重复文字组之间的水平间距 (px)
+            // 约为两个字的宽度（fontSize * 2）
+            colGap: 48,
+
+            // ========== 内容定义（数组配置）==========
+            // 每行是一个数组，数组元素组成一个完整的水印单元
+            // 水印单元内各 part 之间使用 marginLeft 控制间距
+            // 水印单元之间使用 colGap 隔开
+            
+            // 第一行：雪票、酒店...
+            contentRow1: [
+                { text: "雪票、酒店、教练、摄影师、约玩", fontSize: 24, fontWeight: 500 }
+            ],
+            
+            // 第二行：滑呗 app 1000万雪友的选择
+            contentRow2: [
+                { text: "滑呗", fontSize: 30, fontWeight: 900 },
+                { text: "app", fontSize: 24, fontWeight: 500, marginLeft: 4 },
+                { text: "1000万雪友的选择", fontSize: 24, fontWeight: 500, marginLeft: 4 }
+            ]
+        };
+
+        /**
+         * 核心渲染逻辑
+         */
+        function initWatermark(imgWidth, imgHeight) {
+            const container = document.getElementById('watermark-container');
+            
+            // 1. 根据原图尺寸和旋转角度计算最小容器尺寸
+            // 旋转后要覆盖原图，容器需要的最小尺寸：
+            // containerW = imgW * |cos(θ)| + imgH * |sin(θ)|
+            // containerH = imgW * |sin(θ)| + imgH * |cos(θ)|
+            const angleRad = Math.abs(config.rotateAngle) * Math.PI / 180;
+            const cosA = Math.cos(angleRad);
+            const sinA = Math.sin(angleRad);
+            
+            const containerWidth = Math.ceil(imgWidth * cosA + imgHeight * sinA);
+            const containerHeight = Math.ceil(imgWidth * sinA + imgHeight * cosA);
+            
+            // 设置容器尺寸
+            container.style.width = containerWidth + 'px';
+            container.style.height = containerHeight + 'px';
+            
+            // 2. 应用旋转角度
+            container.style.transform = `translate(-50%, -50%) rotate(${config.rotateAngle}deg)`;
+
+            // 3. 根据容器尺寸计算行数和列数
+            const rowHeight = config.fontSize + config.rowGap;
+            const estimatedRows = Math.ceil(containerHeight / rowHeight) + 2; // +2 确保边缘覆盖
+            
+            // 估算每行重复次数
+            const estimatedItemWidth = 300 + config.colGap; // 大致估算单个文字组宽度
+            const repeatCount = Math.ceil(containerWidth / estimatedItemWidth) + 2; 
+
+            // 4. 计算垂直对齐所需的水平偏移
+            // 旋转后，为了让相同内容的行在视觉上垂直对齐，
+            // 每行需要向左偏移 y * tan(angle) 的距离
+            const tanAngle = Math.tan(angleRad);
+
+            // 5. 基础样式（字体抗锯齿）
+            const baseStyle = `
+                font-family: ${config.fontFamily};
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+            `;
+
+            // 6. 根据数组配置构建水印单元 HTML
+            function buildItemHtml(parts) {
+                const partsHtml = parts.map(part => 
+                    `<span style="
+                        font-size: ${part.fontSize || config.fontSize}px;
+                        font-weight: ${part.fontWeight || 400};
+                        margin-left: ${part.marginLeft || 0}px;
+                    ">${part.text}</span>`
+                ).join('');
+                
+                return `
+                    <div class="wm-text-item" style="
+                        ${baseStyle}
+                        color: ${config.color};
+                        display: inline-flex;
+                        align-items: baseline;
+                    ">
+                        ${partsHtml}
+                    </div>
+                `;
+            }
+
+            const itemHtml1 = buildItemHtml(config.contentRow1);
+            const itemHtml2 = buildItemHtml(config.contentRow2);
+
+            // 7. 循环生成 DOM
+            let finalHtml = '';
+            // 以中间行为基准，计算相对偏移
+            const centerRow = Math.floor(estimatedRows / 2);
+
+            for (let r = 0; r < estimatedRows; r++) {
+                // 判断奇偶行来决定内容
+                const isRow1 = r % 2 === 0;
+                const contentUnit = isRow1 ? itemHtml1 : itemHtml2;
+                
+                // 生成一整行的重复内容
+                let rowInnerHtml = '';
+                for (let c = 0; c < repeatCount; c++) {
+                    rowInnerHtml += contentUnit;
+                }
+
+                // 计算该行相对于中心行的垂直距离，然后计算水平偏移
+                // y 向下为正，需要向左偏移（负方向）
+                const yOffset = (r - centerRow) * rowHeight;
+                const xShift = -yOffset * tanAngle;
+
+                // 包装行，应用水平偏移和列间距
+                finalHtml += `
+                    <div class="wm-row" style="
+                        margin-bottom: ${config.rowGap}px;
+                        transform: translateX(${xShift}px);
+                        gap: ${config.colGap}px;
+                    ">
+                        ${rowInnerHtml}
+                    </div>
+                `;
+            }
+
+            // 写入容器
+            container.innerHTML = finalHtml;
+        }
+
+        // 初始化：等待图片加载完成后获取尺寸
+        const bgImage = document.getElementById('background-image');
+        
+        function startWatermark() {
+            const imgWidth = bgImage.naturalWidth;
+            const imgHeight = bgImage.naturalHeight;
+            initWatermark(imgWidth, imgHeight);
+        }
+        
+        if (bgImage.complete) {
+            startWatermark();
+        } else {
+            bgImage.addEventListener('load', startWatermark);
+        }
+
+        // 窗口大小变化时重绘
+        let resizeTimer;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(startWatermark, 300);
+        });
+
+        // ========== 原图拖拽交互 ==========
+        const offsetDisplay = document.getElementById('offset-display');
+        const opacityDisplay = document.getElementById('opacity-display');
+        
+        let offsetX = 0;
+        let offsetY = 0;
+        let opacity = 1;
+        let isDragging = false;
+        let startX, startY;
+
+        // 更新原图位置
+        function updateImagePosition() {
+            bgImage.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+            offsetDisplay.textContent = `X: ${offsetX}, Y: ${offsetY}`;
+        }
+
+        // 更新透明度
+        function updateOpacity() {
+            bgImage.style.opacity = opacity;
+            opacityDisplay.textContent = `${Math.round(opacity * 100)}%`;
+        }
+
+        // 鼠标按下
+        bgImage.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            startX = e.clientX - offsetX;
+            startY = e.clientY - offsetY;
+            bgImage.style.cursor = 'grabbing';
+            e.preventDefault();
+        });
+
+        // 鼠标移动
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            offsetX = e.clientX - startX;
+            offsetY = e.clientY - startY;
+            updateImagePosition();
+        });
+
+        // 鼠标释放
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            bgImage.style.cursor = 'move';
+        });
+
+        // 键盘控制
+        document.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            
+            // R: 重置位置
+            if (key === 'r') {
+                offsetX = 0;
+                offsetY = 0;
+                updateImagePosition();
+            }
+            
+            // H: 隐藏/显示原图
+            if (key === 'h') {
+                bgImage.style.display = bgImage.style.display === 'none' ? 'block' : 'none';
+            }
+            
+            // 上下箭头: 调整透明度
+            if (e.key === 'ArrowUp') {
+                opacity = Math.min(1, opacity + 0.1);
+                updateOpacity();
+                e.preventDefault();
+            }
+            if (e.key === 'ArrowDown') {
+                opacity = Math.max(0, opacity - 0.1);
+                updateOpacity();
+                e.preventDefault();
+            }
+            
+            // 方向键微调位置 (Shift + 方向键)
+            if (e.shiftKey) {
+                const step = 1;
+                if (e.key === 'ArrowLeft') { offsetX -= step; updateImagePosition(); }
+                if (e.key === 'ArrowRight') { offsetX += step; updateImagePosition(); }
+            }
+        });
+    </script>
+</body>
+</html>

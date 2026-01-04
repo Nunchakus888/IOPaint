@@ -125,6 +125,19 @@ class OptimizedWatermarkDetector:
         candidates1 = self._extract_regions_from_mask(closed1, min_area=15)  # 更小的最小面积
         all_candidates.extend(candidates1)
 
+        # # 策略1.5: Sobel增强（水印是中等灰度，人物是高亮）
+        # sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        # sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        # sobel = np.sqrt(sobel_x**2 + sobel_y**2)
+        # sobel = np.uint8(np.clip(sobel, 0, 255))
+        # # 提取中等灰度（水印），排除高亮（人物轮廓）
+        # watermark_mask = cv2.inRange(sobel, 80, 180)
+        # # 用文字特征过滤，保存过滤后的mask
+        # self._sobel_mask = self._filter_text_features(watermark_mask)
+        # candidates_04 = self._extract_regions_from_mask(self._sobel_mask, min_area=10)
+        # all_candidates.extend(candidates_04)
+        # print(f"   Sobel文字特征检测到 {len(candidates_04)} 个区域")
+
         # 策略2: 基于对比度的检测（检测半透明水印）
         blur = cv2.GaussianBlur(gray, (3, 3), 0)  # 轻微模糊保护细节
         contrast = cv2.absdiff(gray, blur)
@@ -142,6 +155,13 @@ class OptimizedWatermarkDetector:
         closed3 = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel3, iterations=1)
         candidates3 = self._extract_regions_from_mask(closed3, min_area=10)
         all_candidates.extend(candidates3)
+
+        # 策略4: FFT高通滤波（增强检测，特别是人物区域的水印）
+        # fft_mask = self._fft_highpass_mask(gray)
+        # self._fft_mask = fft_mask  # 保存用于后续mask生成
+        # candidates4 = self._extract_fft_regions(fft_mask)
+        # all_candidates.extend(candidates4)
+        # print(f"   FFT增强检测到 {len(candidates4)} 个区域")
 
         # 智能去重合并
         all_candidates = self._merge_overlapping_regions(all_candidates, iou_threshold=0.5)
@@ -185,7 +205,7 @@ class OptimizedWatermarkDetector:
             # 综合评分
             score = self._compute_watermark_score(features)
 
-            if score > 0.15:  # 进一步降低阈值，确保不遗漏水印
+            if score > 0.15:  # 恢复标准验证阈值
                 verified_regions.append({
                     'bbox': region,
                     'features': features,
@@ -391,13 +411,12 @@ class OptimizedWatermarkDetector:
         # 结合两种对比度：主要文字 + 标点细节
         combined_contrast = cv2.addWeighted(contrast_main, 0.7, contrast_detail, 0.3, 0)
 
-        # 优化的二值化策略 - 确保文字和标点都被正确分割
-        # 使用自适应阈值 + OTSU，确保细节被保留
+        # 增强的二值化策略 - 添加固定阈值提升检测率
         thresh_adaptive = cv2.adaptiveThreshold(
             combined_contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 7, 2
         )
 
-        # OTSU阈值作为补充，确保弱对比度区域也被检测
+        # OTSU阈值作为补充
         _, thresh_otsu = cv2.threshold(combined_contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # 合并两种阈值结果，确保文字和标点都被覆盖
@@ -431,6 +450,156 @@ class OptimizedWatermarkDetector:
         full_mask[y1:y2, x1:x2] = refined
 
         return full_mask
+
+    def _fft_highpass_mask(self, gray: np.ndarray) -> np.ndarray:
+        """FFT高通滤波 - 去除低频背景，保留高频水印边缘"""
+        h, w = gray.shape
+        
+        # FFT变换
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        
+        # 创建高通滤波器（中心为0，边缘为1）
+        crow, ccol = h // 2, w // 2
+        mask_fft = np.ones((h, w), np.float32)
+        r = 30  # 截止半径
+        cv2.circle(mask_fft, (ccol, crow), r, 0, -1)
+        
+        # 应用滤波器
+        fshift_filtered = fshift * mask_fft
+        f_ishift = np.fft.ifftshift(fshift_filtered)
+        img_back = np.fft.ifft2(f_ishift)
+        img_back = np.abs(img_back)
+        
+        # 归一化
+        result = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        return result
+    
+    def _extract_watermark_regions(self, fft_mask: np.ndarray, max_area: int) -> List[np.ndarray]:
+        """从FFT高通结果提取水印区域，过滤人物轮廓"""
+        h, w = fft_mask.shape
+        
+        # 更高阈值：只保留明显的水印（亮度>50）
+        _, binary = cv2.threshold(fft_mask, 50, 255, cv2.THRESH_BINARY)
+        
+        # 保存这个中间结果用于直接生成mask
+        self._fft_binary = binary.copy()
+        
+        # 去除大块连通区域（人物轮廓）
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 创建过滤后的mask
+        filtered_mask = binary.copy()
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            
+            # 过滤大块区域（人物轮廓）
+            if area > max_area:
+                cv2.drawContours(filtered_mask, [cnt], -1, 0, -1)
+                continue
+            
+            # 过滤细长区域（人物边缘线）
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 15 and area > 500:
+                cv2.drawContours(filtered_mask, [cnt], -1, 0, -1)
+                continue
+        
+        # 保存过滤后的mask
+        self._fft_filtered = filtered_mask
+        
+        # 提取候选区域
+        contours, _ = cv2.findContours(filtered_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 15:  # 过滤噪点
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            candidates.append(np.array([x, y, x + bw, y + bh]))
+        
+        return candidates
+
+    def _fft_highpass_mask(self, gray: np.ndarray) -> np.ndarray:
+        """FFT高通滤波 - 增强水印边缘，去除低频背景"""
+        h, w = gray.shape
+        
+        # FFT变换
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        
+        # 高通滤波器（中心为0）
+        crow, ccol = h // 2, w // 2
+        mask_fft = np.ones((h, w), np.float32)
+        r = 30  # 截止半径
+        cv2.circle(mask_fft, (ccol, crow), r, 0, -1)
+        
+        # 应用滤波并逆变换
+        fshift_filtered = fshift * mask_fft
+        f_ishift = np.fft.ifftshift(fshift_filtered)
+        img_back = np.abs(np.fft.ifft2(f_ishift))
+        
+        return cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    def _extract_fft_regions(self, fft_mask: np.ndarray) -> List[np.ndarray]:
+        """从FFT高通结果提取水印区域，过滤人物轮廓"""
+        h, w = fft_mask.shape
+        max_area = w * h * 0.015  # 过滤大块区域
+        
+        # 阈值分割
+        _, binary = cv2.threshold(fft_mask, 40, 255, cv2.THRESH_BINARY)
+        
+        # 保存FFT二值结果，后续合并到最终mask
+        self._fft_binary = binary.copy()
+        
+        # 提取轮廓并过滤
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 15 or area > max_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            # 过滤细长区域（人物边缘）
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 15 and area > 300:
+                continue
+            candidates.append(np.array([x, y, x + bw, y + bh]))
+        
+        return candidates
+
+
+
+    def _ocr_on_enhanced(self, gray: np.ndarray) -> List[np.ndarray]:
+        """在自适应阈值增强图像上运行OCR，识别率更高"""
+        if self.reader is None:
+            return []
+        
+        # 自适应阈值增强（与09_adaptive_thresh相同）
+        enhanced = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        
+        try:
+            enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            results = self.reader.readtext(enhanced_bgr, detail=1)
+            
+            candidates = []
+            for (bbox, text, conf) in results:
+                if conf < 0.1:
+                    continue
+                pts = np.array(bbox)
+                x1, y1 = pts.min(axis=0).astype(int)
+                x2, y2 = pts.max(axis=0).astype(int)
+                candidates.append(np.array([x1, y1, x2, y2]))
+            
+            return candidates
+        except Exception as e:
+            print(f"   ⚠️ Enhanced OCR failed: {e}")
+            return []
 
     def _extract_regions_from_mask(self, mask: np.ndarray, min_area: int = 50) -> List[np.ndarray]:
         """从mask提取区域bbox"""
@@ -564,7 +733,7 @@ class OptimizedWatermarkDetector:
 
     def generate_mask(self, image: np.ndarray, preview_path: Optional[str] = None) -> np.ndarray:
         """
-        生成最终水印mask - 简化的主接口
+        生成最终水印mask - 合并传统检测 + FFT增强结果
 
         返回: 二值mask (255=水印区域, 0=背景)
         """
@@ -576,6 +745,16 @@ class OptimizedWatermarkDetector:
         for detection in detections:
             final_mask = cv2.bitwise_or(final_mask, detection.mask)
 
+        # 合并FFT二值结果（增强检出率）
+        if hasattr(self, '_fft_binary') and self._fft_binary is not None:
+            fft_filtered = self._filter_large_regions(self._fft_binary)
+            final_mask = cv2.bitwise_or(final_mask, fft_filtered)
+        
+        # 合并Sobel中灰度结果（04效果）
+        if hasattr(self, '_sobel_mask') and self._sobel_mask is not None:
+            sobel_filtered = self._filter_large_regions(self._sobel_mask)
+            final_mask = cv2.bitwise_or(final_mask, sobel_filtered)
+
         # 最终形态学优化
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -585,22 +764,76 @@ class OptimizedWatermarkDetector:
         print(f"💾 Mask coverage: {coverage:.1f}%")
         return final_mask
 
+    def _filter_text_features(self, binary: np.ndarray) -> np.ndarray:
+        """过滤非文字区域，保留水印文字特征"""
+        h, w = binary.shape
+        filtered = np.zeros_like(binary)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 5 or area > w * h * 0.003:  # 太小或太大
+                continue
+            
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            
+            # 文字特征：宽高比适中（不是细长线条）
+            if aspect > 15:
+                continue
+            
+            # 凸性检查：文字区域相对规则
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0 and area / hull_area < 0.2:
+                continue
+            
+            cv2.drawContours(filtered, [cnt], -1, 255, -1)
+        
+        return filtered
+
+    def _filter_large_regions(self, binary: np.ndarray) -> np.ndarray:
+        """过滤大块区域（人物轮廓），保留小块水印"""
+        h, w = binary.shape
+        max_area = w * h * 0.01
+        
+        filtered = binary.copy()
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > max_area:
+                cv2.drawContours(filtered, [cnt], -1, 0, -1)
+        
+        return filtered
+
 
 def main():
-    """使用示例 - 支持轮次目录结构"""
+    """使用示例 - 支持轮次目录和批量处理"""
     import argparse
     import os
+    import glob
 
     parser = argparse.ArgumentParser(description='优化版水印检测器')
-    parser.add_argument('-r', '--round', required=True, help='轮次目录 (如: 1, 2, 3)')
+    parser.add_argument('-r', '--round', help='轮次目录 (如: 1, 2, 3)')
+    parser.add_argument('-d', '--dir', help='批量处理目录')
+    parser.add_argument('-p', '--pattern', default='*', help='文件名匹配模式 (如: x700)')
     parser.add_argument('--preview', action='store_true', help='生成检测过程预览图')
     parser.add_argument('--simple-preview', action='store_true', help='生成简单的最终结果预览图')
     parser.add_argument('--no-preview', action='store_true', help='禁用所有预览功能')
 
     args = parser.parse_args()
 
+    # 批量处理模式
+    if args.dir:
+        batch_process(args)
+        return
+
+    if not args.round:
+        parser.error('-r/--round 或 -d/--dir 必须指定一个')
+
     # 构建路径
-    round_dir = args.round
+    round_dir = f'runs/{args.round}'
     input_path = 'sample.jpg'
     output_path = os.path.join(round_dir, 'mask.png')
 
@@ -654,58 +887,173 @@ def main():
 
     print(f"✅ Round {args.round} completed!")
 
+def batch_process(args):
+    """批量处理目录下的图片"""
+    import os
+    import glob
+    
+    input_dir = os.path.expanduser(args.dir)
+    if not os.path.isdir(input_dir):
+        print(f"❌ 目录不存在: {input_dir}")
+        return
+    
+    # 查找匹配的图片
+    patterns = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+    all_images = []
+    for pat in patterns:
+        all_images.extend(glob.glob(os.path.join(input_dir, pat)))
+    
+    # 按pattern过滤
+    if args.pattern != '*':
+        all_images = [f for f in all_images if args.pattern in os.path.basename(f)]
+    
+    if not all_images:
+        print(f"❌ 未找到匹配的图片 (pattern: {args.pattern})")
+        return
+    
+    print(f"🎯 找到 {len(all_images)} 张图片待处理")
+    
+    # 创建输出目录
+    output_dir = os.path.join(input_dir, 'watermark_removed')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 创建检测器（复用）
+    detector = OptimizedWatermarkDetector(enable_preview=not args.no_preview)
+    
+    success, failed = 0, 0
+    for i, img_path in enumerate(sorted(all_images), 1):
+        filename = os.path.basename(img_path)
+        name, ext = os.path.splitext(filename)
+        
+        print(f"\n[{i}/{len(all_images)}] 处理: {filename}")
+        
+        try:
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"   ❌ 无法读取图片")
+                failed += 1
+                continue
+            
+            # 生成mask
+            mask_path = os.path.join(output_dir, f"{name}_mask.png")
+            preview_path = os.path.join(output_dir, f"{name}_preview.jpg") if args.preview else None
+            
+            mask = detector.generate_mask(image, preview_path)
+            cv2.imwrite(mask_path, mask)
+            
+            # 运行水印去除
+            output_path = os.path.join(output_dir, f"{name}_clean{ext}")
+            run_iopaint(img_path, mask_path, output_path)
+            
+            success += 1
+            print(f"   ✅ 完成 → {os.path.basename(output_path)}")
+            
+        except Exception as e:
+            print(f"   ❌ 错误: {e}")
+            failed += 1
+    
+    print(f"\n🏁 批量处理完成: 成功 {success}, 失败 {failed}")
+    print(f"📁 输出目录: {output_dir}")
+
+def run_iopaint(input_image: str, mask_file: str, output_file: str):
+    """运行iopaint去除水印"""
+    import subprocess
+    import os
+    
+    output_dir = os.path.dirname(output_file)
+    cmd = [
+        "conda", "run", "-n", "py312aiwatermark",
+        "env", "KMP_DUPLICATE_LIB_OK=TRUE",
+        "iopaint", "run",
+        "--model=lama", "--device=cpu",
+        f"--image={input_image}",
+        f"--mask={mask_file}",
+        f"--output={output_dir}"
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"iopaint失败: {result.stderr}")
+
 def run_watermark_removal(round_dir: str, input_image: str, mask_file: str):
     """运行水印去除命令"""
     import subprocess
     import os
 
-    # 首先检查iopaint是否可用
+    # 首先检查iopaint是否可用（在正确的conda环境中）
     try:
-        result = subprocess.run(["iopaint", "--help"], capture_output=True, text=True, timeout=10)
+        # 使用conda run来确保在正确的环境中运行
+        result = subprocess.run([
+            "conda", "run", "-n", "py312aiwatermark",
+            "iopaint", "--help"
+        ], capture_output=True, text=True, timeout=10)
         iopaint_available = result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
         iopaint_available = False
 
     if not iopaint_available:
-        print("⚠️ iopaint command not found. Skipping automatic watermark removal.")
-        print("💡 To enable automatic removal, install IOPaint and ensure it's in PATH")
-        print("   Manual command format:")
-        print(f"   iopaint run --model=lama --device=cpu --image={input_image} --mask={mask_file} --output={round_dir}/output.jpg")
+        print("⚠️ iopaint command not found or conda environment issue. Skipping automatic watermark removal.")
+        print("💡 To enable automatic removal:")
+        print("   1. Activate conda environment: conda activate py312aiwatermark")
+        print("   2. Install IOPaint if not installed")
+        print("   3. Or run manually:")
+        print(f"   conda run -n py312aiwatermark iopaint run --model=lama --device=cpu --image={input_image} --mask={mask_file} --output={round_dir}/output.jpg")
         return
 
-    # 构建输出路径（在同一目录下）
-    base_name = os.path.splitext(os.path.basename(input_image))[0]
-    output_file = round_dir
+    # 设置输出目录（iopaint会在其中生成文件）
+    output_dir = round_dir
 
-    # 构建iopaint命令
+    # 构建正确的输入文件路径
+    input_image_path = os.path.join(round_dir, 'input.jpg')
+    if not os.path.exists(input_image_path):
+        input_image_path = input_image  # fallback to original path
+
+    # 确保路径是绝对路径
+    input_image_path = os.path.abspath(input_image_path)
+    mask_file = os.path.abspath(mask_file)
+
+    # 构建iopaint命令（通过conda run在正确环境中运行，并设置环境变量）
     cmd = [
+        "conda", "run", "-n", "py312aiwatermark",
+        "env", "KMP_DUPLICATE_LIB_OK=TRUE",
         "iopaint", "run",
         "--model=lama",
         "--device=cpu",
-        f"--image={input_image}",
+        f"--image={input_image_path}",
         f"--mask={mask_file}",
-        f"--output={output_file}"
+        f"--output={output_dir}"
     ]
 
     print(f"🔧 Running: {' '.join(cmd)}")
 
     try:
-        # 设置环境变量避免库冲突
-        env = os.environ.copy()
-        env['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+        # 执行命令（环境变量已在conda run中设置）
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-        # 执行命令
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        # 调试信息：显示完整输出
+        if result.stdout:
+            print(f"📝 IOPaint stdout: {result.stdout[:200]}...")
+        if result.stderr:
+            print(f"⚠️ IOPaint stderr: {result.stderr[:200]}...")
 
         if result.returncode == 0:
-            print(f"✨ Watermark removal completed: {output_file}")
+            print(f"✨ Watermark removal completed to directory: {output_dir}")
 
-            # 检查输出文件是否存在
-            if os.path.exists(output_file):
-                file_size = os.path.getsize(output_file)
-                print(f"📊 Output file size: {file_size} bytes")
-            else:
-                print("⚠️ Output file was not created")
+            # 检查输出目录中是否有水印去除结果文件
+            try:
+                output_files = [f for f in os.listdir(output_dir)
+                              if f.endswith(('.jpg', '.png', '.jpeg')) and
+                              f not in ['input.jpg', 'mask.png', 'detection_preview.jpg']]
+
+                if output_files:
+                    for output_file in output_files:
+                        file_path = os.path.join(output_dir, output_file)
+                        file_size = os.path.getsize(file_path)
+                        print(f"✨ Watermark removed: {output_file} ({file_size:,} bytes)")
+                else:
+                    print("⚠️ No output image files found (watermark removal may have failed)")
+            except Exception as e:
+                print(f"⚠️ Error checking output files: {e}")
 
         else:
             print(f"❌ Watermark removal failed (exit code: {result.returncode})")

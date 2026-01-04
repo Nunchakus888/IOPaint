@@ -148,15 +148,28 @@ def extract_watermarks_by_group(input_folder, output_folder):
         result = result.astype(np.uint8)
 
         # 2. 阈值提取
-        _, mask = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        _, raw_mask = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         
-        # 3. 基于几何特征去噪：利用25度倾斜的平行行特征
-        mask = filter_by_line_geometry(mask, angle_deg=25, line_width=25, min_density_ratio=0.2)
+        # 3. 斜向文字水印：几何过滤
+        text_mask = filter_by_line_geometry(raw_mask, angle_deg=25, line_width=25, min_density_ratio=0.2)
         
-        # 4. 闭运算连接断开的笔画
+        # 4. 矩形水印：被几何过滤掉的大面积密集区域
+        # 原理：矩形水印不符合 25 度倾斜特征，会被过滤掉
+        filtered_out = cv2.subtract(raw_mask, text_mask)
+        # 闭运算连接内部碎片
+        filtered_out = cv2.morphologyEx(filtered_out, cv2.MORPH_CLOSE, np.ones((10,10), np.uint8))
+        # 保留大面积区域（矩形水印特征）
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(filtered_out, connectivity=8)
+        rect_mask = np.zeros_like(filtered_out)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= 500:  # 大面积才是矩形水印
+                rect_mask[labels == i] = 255
+        
+        # 5. 合并两类水印
+        mask = cv2.bitwise_or(text_mask, rect_mask)
+        
+        # 6. 闭运算 + 小区域过滤
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
-        
-        # 5. 移除小连通区域（清理残留细线噪点）
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         clean_mask = np.zeros_like(mask)
         for i in range(1, num_labels):

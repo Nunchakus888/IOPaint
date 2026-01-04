@@ -14,7 +14,7 @@ from gemini2 import scan_images_recursive, extract_watermarks_by_group
 # === 配置 ===
 INPUT_DIR = 'enhance_analysis/images'
 MASK_DIR = 'enhance_analysis/masks'
-OUTPUT_DIR = 'enhance_analysis/output'
+OUTPUT_DIR = 'enhance_analysis/output/01-04'
 MODEL = 'lama'
 DEVICE = 'cpu'
 

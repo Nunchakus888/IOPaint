@@ -147,26 +147,26 @@ def extract_watermarks_by_group(input_folder, output_folder):
         result = cv2.normalize(accum_energy, None, 0, 255, cv2.NORM_MINMAX)
         result = result.astype(np.uint8)
 
-        # 2. 阈值提取
-        _, raw_mask = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        # 2. 双阈值提取
+        otsu_thresh, _ = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         
-        # 3. 斜向文字水印：几何过滤
+        # 常规阈值 → 斜向文字水印
+        _, raw_mask = cv2.threshold(result, int(otsu_thresh), 255, cv2.THRESH_BINARY)
         text_mask = filter_by_line_geometry(raw_mask, angle_deg=25, line_width=25, min_density_ratio=0.2)
         
-        # 4. 矩形水印：被几何过滤掉的大面积密集区域
-        # 原理：矩形水印不符合 25 度倾斜特征，会被过滤掉
-        filtered_out = cv2.subtract(raw_mask, text_mask)
-        # 闭运算连接内部碎片
-        filtered_out = cv2.morphologyEx(filtered_out, cv2.MORPH_CLOSE, np.ones((10,10), np.uint8))
-        # 保留大面积区域（矩形水印特征）
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(filtered_out, connectivity=8)
-        rect_mask = np.zeros_like(filtered_out)
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] >= 500:  # 大面积才是矩形水印
-                rect_mask[labels == i] = 255
+        # 高阈值 → 固定水印（每张图都有，累加信号极强）
+        high_thresh = min(int(otsu_thresh * 1.8), 220)
+        _, fixed_mask = cv2.threshold(result, high_thresh, 255, cv2.THRESH_BINARY)
         
-        # 5. 合并两类水印
-        mask = cv2.bitwise_or(text_mask, rect_mask)
+        # 过滤异常大区域（固定水印通常面积适中）
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fixed_mask, connectivity=8)
+        max_area = w * h * 0.1  # 不超过图像面积的 10%
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] > max_area:
+                fixed_mask[labels == i] = 0
+        
+        # 3. 合并
+        mask = cv2.bitwise_or(text_mask, fixed_mask)
         
         # 6. 闭运算 + 小区域过滤
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))

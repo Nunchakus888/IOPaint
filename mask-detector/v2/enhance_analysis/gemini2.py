@@ -46,17 +46,16 @@ def filter_by_line_geometry(mask, angle_deg=25, line_width=25, min_density_ratio
     # 标记有效区域
     valid_proj = density >= threshold
     
-    # 边缘修复：首尾区域使用更宽松的阈值
-    # 尾部范围要更大，因为右下角截断更严重
-    head_range = line_width
-    tail_range = line_width * 2  # 尾部用更大范围
+
+    # 膨胀有效区域：保护每行边缘（解决"平整切边"问题）
+    # dilate_size = line_width // 2
+    # valid_proj = np.convolve(valid_proj.astype(int), np.ones(dilate_size), mode='same') > 0
     
-    # 首部修复
+    # # 首尾修复：边界区域用更宽松阈值
+    head_range, tail_range = line_width, line_width * 2
     for i in range(min(head_range, n)):
         if density[i] >= threshold * 0.3:
             valid_proj[i] = True
-    
-    # 尾部修复（范围更大，阈值更低）
     for i in range(max(0, n - tail_range), n):
         if density[i] >= threshold * 0.1:  # 更宽松
             valid_proj[i] = True
@@ -151,24 +150,26 @@ def extract_watermarks_by_group(input_folder, output_folder):
         otsu_thresh, _ = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         
         # 常规阈值 → 斜向文字水印
-        _, raw_mask = cv2.threshold(result, int(otsu_thresh), 255, cv2.THRESH_BINARY)
-        text_mask = filter_by_line_geometry(raw_mask, angle_deg=25, line_width=25, min_density_ratio=0.2)
+        _, raw_mask = cv2.threshold(result, int(otsu_thresh * 0.9), 255, cv2.THRESH_BINARY)
+        text_mask = filter_by_line_geometry(raw_mask, angle_deg=25, line_width=25, min_density_ratio=0.15)
         
-        # 高阈值 → 固定水印（每张图都有，累加信号极强）
+        # 高阈值 → 不规则水印（不在行上的部分）
         high_thresh = min(int(otsu_thresh * 1.8), 220)
         _, fixed_mask = cv2.threshold(result, high_thresh, 255, cv2.THRESH_BINARY)
+        extra_mask = cv2.subtract(fixed_mask, text_mask)
         
-        # 过滤异常大区域（固定水印通常面积适中）
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fixed_mask, connectivity=8)
-        max_area = w * h * 0.1  # 不超过图像面积的 10%
+        # 面积过滤
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(extra_mask, connectivity=8)
         for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] > max_area:
-                fixed_mask[labels == i] = 0
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 100 or area > w * h * 0.03:
+                extra_mask[labels == i] = 0
         
         # 3. 合并
-        mask = cv2.bitwise_or(text_mask, fixed_mask)
+        mask = cv2.bitwise_or(text_mask, extra_mask)
         
-        # 6. 闭运算 + 小区域过滤
+        # 4. 轻微膨胀 + 闭运算（确保覆盖完整，避免斑点残留）
+        # mask = cv2.dilate(mask, np.ones((2,2), np.uint8), iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         clean_mask = np.zeros_like(mask)
@@ -177,6 +178,14 @@ def extract_watermarks_by_group(input_folder, output_folder):
                 clean_mask[labels == i] = 255
         mask = clean_mask
 
+        # 合并手动标记（如有）
+        manual_path = os.path.join(output_folder, 'manual_marks', f'{w}x{h}_manual_mask.png')
+        if os.path.exists(manual_path):
+            manual_mask = cv2.imread(manual_path, cv2.IMREAD_GRAYSCALE)
+            if manual_mask is not None and manual_mask.shape == mask.shape:
+                mask = cv2.bitwise_or(mask, manual_mask)
+                print(f"  📎 已合并手动标记: {manual_path}")
+        
         # 保存结果
         output_filename = f"mask_{w}x{h}.png"
         output_path = os.path.join(output_folder, output_filename)
@@ -184,8 +193,9 @@ def extract_watermarks_by_group(input_folder, output_folder):
         
         print(f"✅ 完成！高质量Mask已保存至: {output_path}\n")
 
-# --- 配置 ---
-INPUT_DIR = 'enhance_analysis/images'
-OUTPUT_DIR = 'enhance_analysis/masks'
 
-extract_watermarks_by_group(INPUT_DIR, OUTPUT_DIR)
+
+if __name__ == "__main__":
+    INPUT_DIR = 'enhance_analysis/images'
+    OUTPUT_DIR = 'enhance_analysis/masks'
+    extract_watermarks_by_group(INPUT_DIR, OUTPUT_DIR)
